@@ -589,6 +589,52 @@ def is_probably_vmg_raw_excel(uploaded_file) -> bool:
     except Exception:
         return False
 
+def is_probably_gls_pal_raw_excel(uploaded_file) -> bool:
+    try:
+        xls = pd.ExcelFile(uploaded_file)
+
+        if "facture_palette_brut" in xls.sheet_names:
+            return False
+
+        sheet = xls.sheet_names[0]
+        df0 = pd.read_excel(xls, sheet_name=sheet, nrows=20)
+
+        cols = {str(c).strip().upper() for c in df0.columns}
+
+        markers = {
+            "NO_FACTURE",
+            "DATE_FACTURE",
+            "NO_ENVOI",
+            "REF_EXPED",
+            "CP_EXPED",
+            "PAYS_EXPED",
+            "CP_DEST",
+            "PAYS_DEST",
+            "NB_PALETTE",
+            "TYPE_FRAIS",
+            "MONTANT_HT",
+        }
+
+        hits = len(cols.intersection(markers))
+
+        if hits >= 8:
+            return True
+
+        # sécurité supplémentaire sur le contenu
+        sample_text = " ".join(
+            str(v) for v in df0.fillna("").astype(str).values.flatten()
+        ).upper()
+
+        if "FRAIS DE PORT (PICK&RETURN)" in sample_text:
+            return True
+        if "NB_PALETTE" in sample_text and "TYPE_FRAIS" in sample_text:
+            return True
+
+        return False
+
+    except Exception:
+        return False
+
 
 # =========================
 # CONVERTISSEURS
@@ -1147,6 +1193,125 @@ def convert_vmg_palette_to_standard(file_bytes) -> tuple[pd.DataFrame, pd.DataFr
     df_std = pd.DataFrame(rows)
     return df_std, src
 
+def convert_gls_palette_to_standard(file_bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
+    src = pd.read_excel(file_bytes).copy()
+
+    src.columns = [str(c).strip() for c in src.columns]
+
+    def clean_num_series(s: pd.Series) -> pd.Series:
+        return (
+            s.astype(str)
+             .str.replace(",", ".", regex=False)
+             .str.strip()
+             .replace({"": np.nan, "nan": np.nan, "None": np.nan})
+             .pipe(pd.to_numeric, errors="coerce")
+        )
+
+    # colonnes principales
+    col_fact = "NO_FACTURE" if "NO_FACTURE" in src.columns else None
+    col_date = "DATE_FACTURE" if "DATE_FACTURE" in src.columns else None
+    col_envoi = "NO_ENVOI" if "NO_ENVOI" in src.columns else None
+    col_ref = "REF_EXPED" if "REF_EXPED" in src.columns else None
+    col_cp_exp = "CP_EXPED" if "CP_EXPED" in src.columns else None
+    col_pays_exp = "PAYS_EXPED" if "PAYS_EXPED" in src.columns else None
+    col_cp_dest = "CP_DEST" if "CP_DEST" in src.columns else None
+    col_pays_dest = "PAYS_DEST" if "PAYS_DEST" in src.columns else None
+    col_nb_pal = "NB_PALETTE" if "NB_PALETTE" in src.columns else None
+    col_poids = "POIDS" if "POIDS" in src.columns else None
+    col_type_frais = "TYPE_FRAIS" if "TYPE_FRAIS" in src.columns else None
+    col_montant = "MONTANT_HT" if "MONTANT_HT" in src.columns else None
+
+    missing = [name for name, col in [
+        ("NO_FACTURE", col_fact),
+        ("DATE_FACTURE", col_date),
+        ("NO_ENVOI", col_envoi),
+        ("PAYS_EXPED", col_pays_exp),
+        ("CP_EXPED", col_cp_exp),
+        ("PAYS_DEST", col_pays_dest),
+        ("CP_DEST", col_cp_dest),
+        ("TYPE_FRAIS", col_type_frais),
+        ("MONTANT_HT", col_montant),
+    ] if col is None]
+
+    if missing:
+        raise ValueError(f"Colonnes GLS PAL manquantes: {missing}")
+
+    src["__montant__"] = clean_num_series(src[col_montant]).fillna(0.0)
+    src["__poids__"] = clean_num_series(src[col_poids]).fillna(0.0) if col_poids else 0.0
+    src["__nb_pal__"] = clean_num_series(src[col_nb_pal]).fillna(0.0) if col_nb_pal else 0.0
+    src["__type_frais__"] = src[col_type_frais].astype(str).str.strip().str.upper()
+
+    grp = src.groupby(col_envoi, dropna=False)
+    is_palette_envoi = grp.apply(
+        lambda g: (
+            (pd.to_numeric(g["__nb_pal__"], errors="coerce").fillna(0.0) > 0).any()
+            or g["__type_frais__"].str.contains("PALETTE", na=False).any()
+            or g["__type_frais__"].str.contains("PICK&RETURN", na=False).any()
+        )
+    )
+
+    palette_ids = set(is_palette_envoi[is_palette_envoi].index.tolist())
+    src = src[src[col_envoi].isin(palette_ids)].copy()
+
+    if src.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    rows = []
+
+    def compute_type_ligne(type_frais: str) -> str:
+        s = str(type_frais).upper()
+
+        if s == "FRAIS DE PORT":
+            return "BASE"
+        if "PICK&RETURN" in s:
+            return "AUTRES"
+        if "KILOMET" in s:
+            return "KM"
+        if "ENERG" in s:
+            return "GAZOIL"
+        if "SECUR" in s or "SÈCUR" in s:
+            return "AUTRES"
+        if "PALETTE" in s:
+            return "AUTRES"
+        if "ETIQUET" in s:
+            return "AUTRES"
+        if "NON EXECUTE" in s or "NON EXECUT" in s:
+            return "AUTRES"
+
+        return "AUTRES"
+
+    for _, r in src.iterrows():
+        montant = float(r.get("__montant__", 0.0) or 0.0)
+        type_frais = str(r.get("__type_frais__", "")).upper()
+
+        nb_pal = float(r.get("__nb_pal__", 0.0) or 0.0)
+        if nb_pal == 0 and type_frais in ["FRAIS DE PORT", "FRAIS DE PORT (PICK&RETURN)"]:
+            nb_pal = 1.0
+
+        pick_return_amount = montant if "PICK&RETURN" in type_frais else 0.0
+
+        rows.append({
+            "numero_facture": str(r.get(col_fact, "")).strip(),
+            "date_facture": pd.to_datetime(r.get(col_date, None), errors="coerce"),
+            "reference_expedition": str(r.get(col_envoi, "")).strip(),
+            "reference_client": str(r.get(col_ref, "")).strip() if col_ref else "",
+            "transporteur": "GLS",
+            "service_code": "GLS_PAL",
+            "pays_orig": str(r.get(col_pays_exp, "")).strip().upper(),
+            "cp_orig": normaliser_cp_text(r.get(col_cp_exp, "")),
+            "pays_dest": str(r.get(col_pays_dest, "")).strip().upper(),
+            "cp_dest": normaliser_cp_text(r.get(col_cp_dest, "")),
+            "nb_palettes": nb_pal,
+            "poids_total_kg": float(r.get("__poids__", 0.0) or 0.0),
+            "distance_km": 0.0,
+            "type_ligne": compute_type_ligne(type_frais),
+            "montant_ht": montant,
+            "surcharge_pick_return": pick_return_amount,
+        })
+
+    df_std = pd.DataFrame(rows)
+    return df_std, src
+
 
 
 CARRIERS = {
@@ -1163,6 +1328,11 @@ CARRIERS = {
     "VMG": {
         "detect": is_probably_vmg_raw_excel,
         "convert": convert_vmg_palette_to_standard,
+        "segment": "palettes",
+    },
+    "GLS_PAL": {
+        "detect": is_probably_gls_pal_raw_excel,
+        "convert": convert_gls_palette_to_standard,
         "segment": "palettes",
     },
     "DPD": {
@@ -1186,12 +1356,14 @@ def detect_carrier(uploaded_file) -> str | None:
             return "TFM"
         if "GEODIS" in name:
             return "GEODIS"
+        if "VMG" in name or "VANMIEGHEM" in name:
+            return "VMG"
+        if "GLS_PAL" in name or "GLS PAL" in name:
+            return "GLS_PAL"
         if "DPD" in name:
             return "DPD"
         if "GLS" in name:
             return "GLS"
-        if "VMG" in name or "VANMIEGHEM" in name:
-            return "VMG"
 
         for carrier, cfg in CARRIERS.items():
             try:
@@ -1563,6 +1735,9 @@ def agreger_facture_brut_palette(facture_brut: pd.DataFrame) -> pd.DataFrame:
             df[col] = ""
         df[col] = df[col].astype(str).str.strip()
 
+    if "surcharge_pick_return" not in df.columns:
+        df["surcharge_pick_return"] = 0.0
+
     df["cp_dest"] = df["cp_dest"].apply(normaliser_cp_text)
     df["cp_orig"] = df["cp_orig"].apply(normaliser_cp_text)
     df["pays_dest"] = df["pays_dest"].astype(str).str.strip().str.upper()
@@ -1573,7 +1748,7 @@ def agreger_facture_brut_palette(facture_brut: pd.DataFrame) -> pd.DataFrame:
     df["date_facture"] = df["date_facture"].apply(parse_date_any)
     df["date_facture"] = pd.to_datetime(df["date_facture"], errors="coerce")
 
-    for col in ["montant_ht", "nb_palettes", "distance_km", "poids_total_kg"]:
+    for col in ["montant_ht", "nb_palettes", "distance_km", "poids_total_kg", "surcharge_pick_return"]:
         if col not in df.columns:
             df[col] = 0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
@@ -1597,6 +1772,7 @@ def agreger_facture_brut_palette(facture_brut: pd.DataFrame) -> pd.DataFrame:
             "distance_km": g["distance_km"].max(),
             "poids_total_kg": g["poids_total_kg"].max(),
             "montant_ligne_ht": g["montant_ht"].sum(),
+            "surcharge_pick_return": g["surcharge_pick_return"].sum(),
         })
 
     return df.groupby(group_keys, dropna=False, sort=False).apply(agg_group).reset_index()
@@ -1984,6 +2160,7 @@ def controler_palettes(file_bytes, filename: str, tolerance_eur: float) -> pd.Da
         dist_km = safe_num(r.get("distance_km", 0), 0.0)
         poids_total_kg = safe_num(r.get("poids_total_kg", 0), 0.0)
         montant_facture_ht = safe_num(r.get("montant_ligne_ht", 0), 0.0)
+        surcharge_pick_return = safe_num(r.get("surcharge_pick_return", 0), 0.0)
 
         date_facture = r.get("date_facture", None)
         date_facture_dt = None
@@ -1991,6 +2168,7 @@ def controler_palettes(file_bytes, filename: str, tolerance_eur: float) -> pd.Da
             date_facture_dt = date_facture.to_pydatetime()
         elif isinstance(date_facture, datetime):
             date_facture_dt = date_facture
+
         date_facture_str = date_facture_dt.date().isoformat() if date_facture_dt else ""
 
         trow = choose_tarif_palette(
@@ -2019,6 +2197,10 @@ def controler_palettes(file_bytes, filename: str, tolerance_eur: float) -> pd.Da
                 pays_orig,
                 cp_orig,
             )
+
+            if surcharge_pick_return > 0:
+                raison_diag += " | pick & return"
+
             lignes.append(dict(
                 numero_facture=numero_facture,
                 reference_expedition=reference_expedition,
@@ -2039,6 +2221,7 @@ def controler_palettes(file_bytes, filename: str, tolerance_eur: float) -> pd.Da
                 ecart_ht=np.nan,
                 ecart_pos=0.0,
                 ecart_neg=0.0,
+                surcharge_pick_return=surcharge_pick_return,
                 statut="INCOMPLET",
                 raison=raison_diag,
             ))
@@ -2067,6 +2250,12 @@ def controler_palettes(file_bytes, filename: str, tolerance_eur: float) -> pd.Da
             else:
                 statut, raison = "KO", f"Écart {ecart:.2f}€ > tolérance {tolerance_eur:.2f}€"
 
+        if surcharge_pick_return > 0:
+            if raison:
+                raison += " | pick & return"
+            else:
+                raison = "pick & return"
+
         lignes.append(dict(
             numero_facture=numero_facture,
             reference_expedition=reference_expedition,
@@ -2087,6 +2276,7 @@ def controler_palettes(file_bytes, filename: str, tolerance_eur: float) -> pd.Da
             ecart_ht=ecart,
             ecart_pos=(ecart if ecart > 0 else 0.0),
             ecart_neg=(ecart if ecart < 0 else 0.0),
+            surcharge_pick_return=surcharge_pick_return,
             statut=statut,
             raison=raison,
         ))
@@ -2852,20 +3042,104 @@ def main():
     st.set_page_config(page_title="Contrôle factures transport", layout="wide")
     st.title("🚚 Contrôle factures transport – Colis & Palettes")
     st.markdown(
-    """
-    <style>
-    div[data-testid="stMetric"] {
-        background-color: #f8fafc;
-        border: 1px solid #e2e8f0;
-        padding: 12px 16px;
-        border-radius: 14px;
-    }
-    div[data-testid="stDataFrame"] {
-        border-radius: 14px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
+        """
+        <style>
+
+        /* ===== GLOBAL ===== */
+        html, body, [class*="css"]  {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        }
+
+        .block-container {
+            padding-top: 1.5rem;
+            padding-bottom: 2rem;
+            max-width: 1200px;
+        }
+
+        h1 {
+            font-size: 2.2rem;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+
+        h2, h3 {
+            font-weight: 600;
+            letter-spacing: -0.01em;
+        }
+
+        /* ===== KPI CARDS ===== */
+        div[data-testid="stMetric"] {
+            background: linear-gradient(180deg, #ffffff 0%, #f9fafb 100%);
+            border: 1px solid #e5e7eb;
+            border-radius: 16px;
+            padding: 16px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+            transition: all 0.2s ease;
+        }
+
+        div[data-testid="stMetric"]:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 14px rgba(0,0,0,0.08);
+        }
+
+        div[data-testid="stMetricLabel"] {
+            font-size: 0.85rem;
+            color: #6b7280;
+            font-weight: 600;
+        }
+
+        div[data-testid="stMetricValue"] {
+            font-size: 1.5rem;
+            font-weight: 700;
+        }
+
+        /* ===== BUTTONS ===== */
+        div.stButton > button {
+            border-radius: 12px;
+            border: 1px solid #d1d5db;
+            padding: 0.6rem 1.2rem;
+            font-weight: 600;
+            background: white;
+        }
+
+        div.stButton > button:hover {
+            background: #f3f4f6;
+            border-color: #9ca3af;
+        }
+
+        div[data-testid="stDownloadButton"] > button {
+            border-radius: 12px;
+            font-weight: 600;
+        }
+
+        /* ===== DATAFRAME ===== */
+        div[data-testid="stDataFrame"] {
+            border-radius: 16px;
+            border: 1px solid #e5e7eb;
+            overflow: hidden;
+        }
+
+        /* ===== TABS ===== */
+        button[data-baseweb="tab"] {
+            font-weight: 600;
+            border-radius: 10px;
+        }
+
+        /* ===== SIDEBAR ===== */
+        section[data-testid="stSidebar"] {
+            border-right: 1px solid #e5e7eb;
+        }
+
+        /* ===== SEPARATORS ===== */
+        hr {
+            border: none;
+            border-top: 1px solid #e5e7eb;
+            margin: 1.5rem 0;
+        }
+
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
     init_db()
@@ -2989,45 +3263,92 @@ def main():
         if df_runs.empty:
             st.info("Aucun contrôle disponible.")
         else:
-            run_ids = df_runs["id"].tolist()
-            run_sel = st.selectbox("Choisir un contrôle", run_ids, key="tab3_run_select")
-
-            run_row = df_runs[df_runs["id"] == run_sel].iloc[0]
-            st.caption(
-                f"Fichier : {run_row['filename']} | "
-                f"Date : {run_row['created_at']} | "
-                f"Segment : {run_row['segment']}"
+            mode_dashboard = st.radio(
+                "Mode d'analyse",
+                ["Contrôle sélectionné", "Tous les contrôles"],
+                horizontal=True,
+                key="tab3_mode_dashboard",
             )
 
-            df = get_run_lines(run_sel)
+            if mode_dashboard == "Contrôle sélectionné":
+                run_ids = df_runs["id"].tolist()
+                run_sel = st.selectbox("Choisir un contrôle", run_ids, key="tab3_run_select")
+
+                run_row = df_runs[df_runs["id"] == run_sel].iloc[0]
+                st.caption(
+                    f"Fichier : {run_row['filename']} | "
+                    f"Date : {run_row['created_at']} | "
+                    f"Segment : {run_row['segment']}"
+                )
+
+                df = get_run_lines(run_sel).copy()
+
+            else:
+                st.caption("Vue consolidée sur l’ensemble des contrôles enregistrés.")
+                df = get_all_lines().copy()
 
             if df.empty:
-                st.info("Aucune donnée disponible pour ce contrôle.")
+                st.info("Aucune donnée disponible pour cette vue.")
             else:
                 # =========================
                 # FILTRES
                 # =========================
-                colf1, colf2 = st.columns(2)
+                st.markdown("### 🎛️ Filtres")
+
+                filter_cols = st.columns(4)
+
+                segments = sorted(df["segment"].dropna().astype(str).unique().tolist()) if "segment" in df.columns else []
+                if segments:
+                    segments_sel = filter_cols[0].multiselect(
+                        "Segment",
+                        segments,
+                        default=segments,
+                        key="tab3_segments_filter",
+                    )
+                    df = df[df["segment"].astype(str).isin([str(x) for x in segments_sel])].copy()
 
                 transporteurs = sorted(df["transporteur"].dropna().astype(str).unique().tolist())
-                transporteurs_sel = colf1.multiselect(
-                    "Filtrer par transporteur",
+                transporteurs_sel = filter_cols[1].multiselect(
+                    "Transporteur",
                     transporteurs,
                     default=transporteurs,
                     key="tab3_transporteurs_filter",
                 )
 
                 statuts = ["OK", "KO", "INCOMPLET"]
-                statuts_sel = colf2.multiselect(
-                    "Filtrer par statut",
+                statuts_sel = filter_cols[2].multiselect(
+                    "Statut",
                     statuts,
                     default=statuts,
                     key="tab3_statuts_filter",
                 )
 
+                if "date_facture" in df.columns:
+                    df["date_facture_dt"] = pd.to_datetime(df["date_facture"], errors="coerce")
+                    df_dates = df[df["date_facture_dt"].notna()].copy()
+
+                    if not df_dates.empty:
+                        min_date = df_dates["date_facture_dt"].min().date()
+                        max_date = df_dates["date_facture_dt"].max().date()
+                        date_range = filter_cols[3].date_input(
+                            "Période",
+                            value=(min_date, max_date),
+                            key="tab3_date_range",
+                        )
+
+                        if isinstance(date_range, tuple) and len(date_range) == 2:
+                            date_start, date_end = date_range
+                            df = df[
+                                (df["date_facture_dt"].isna()) |
+                                (
+                                    (df["date_facture_dt"].dt.date >= date_start) &
+                                    (df["date_facture_dt"].dt.date <= date_end)
+                                )
+                            ].copy()
+
                 df = df[
-                    df["transporteur"].astype(str).isin([str(x) for x in transporteurs_sel])
-                    & df["statut"].astype(str).isin([str(x) for x in statuts_sel])
+                    df["transporteur"].astype(str).isin([str(x) for x in transporteurs_sel]) &
+                    df["statut"].astype(str).isin([str(x) for x in statuts_sel])
                 ].copy()
 
                 if df.empty:
@@ -3045,7 +3366,6 @@ def main():
                             df[c] = 0.0
                         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
-
                     # =========================
                     # KPI
                     # =========================
@@ -3062,11 +3382,99 @@ def main():
 
                     taux = (nb_ok / total * 100) if total else 0.0
 
+                    # =========================
+                    # KPI DIRECTION
+                    # =========================
+                    st.markdown("### 🧭 Vue direction")
+
+                    synth_dir = (
+                        df.groupby("transporteur", dropna=False)
+                        .agg(
+                            ecart_pos=("ecart_pos", "sum"),
+                            nb_ko=("statut", lambda s: (s == "KO").sum()),
+                        )
+                        .reset_index()
+                    )
+
+                    if not synth_dir.empty:
+                        worst_row = synth_dir.sort_values("ecart_pos", ascending=False).iloc[0]
+                        worst_transporteur = str(worst_row["transporteur"])
+                        worst_ecart = float(worst_row["ecart_pos"])
+                    else:
+                        worst_transporteur = "-"
+                        worst_ecart = 0.0
+
+                    d1, d2, d3, d4 = st.columns(4)
+                    d1.metric("Montant à réclamer", f"{mt_pos:.2f} €")
+                    d2.metric("Taux de conformité global", f"{taux:.2f} %")
+                    d3.metric("Transporteur le plus en écart", worst_transporteur)
+                    d4.metric("Nb lignes KO", nb_ko)
+
+                    st.caption(
+                        f"Transporteur le plus en écart : {worst_transporteur} "
+                        f"avec {worst_ecart:.2f} € d'écarts positifs."
+                    )
+
+                    st.divider()
+
+                    # =========================
+                    # TOP 5 TRANSPORTEURS
+                    # =========================
+                    st.markdown("### 🏆 Top 5 transporteurs")
+
+                    top5 = (
+                        df.groupby("transporteur", dropna=False)
+                        .agg(
+                            nb_lignes=("numero_facture", "count"),
+                            nb_ok=("statut", lambda s: (s == "OK").sum()),
+                            nb_ko=("statut", lambda s: (s == "KO").sum()),
+                            nb_incomplet=("statut", lambda s: (s == "INCOMPLET").sum()),
+                            montant_facture=("montant_facture_ht", "sum"),
+                            ecart_pos=("ecart_pos", "sum"),
+                            ecart_neg=("ecart_neg", "sum"),
+                        )
+                        .reset_index()
+                    )
+
+                    top5["taux_conformite"] = np.where(
+                        top5["nb_lignes"] > 0,
+                        top5["nb_ok"] / top5["nb_lignes"] * 100,
+                        0.0,
+                    )
+
+                    top5 = top5.sort_values(
+                        ["ecart_pos", "taux_conformite"],
+                        ascending=[False, True]
+                    ).head(5).copy()
+
+                    if not top5.empty:
+                        top5["rang"] = range(1, len(top5) + 1)
+
+                        top5 = top5[
+                            [
+                                "rang",
+                                "transporteur",
+                                "nb_lignes",
+                                "nb_ko",
+                                "nb_incomplet",
+                                "montant_facture",
+                                "ecart_pos",
+                                "ecart_neg",
+                                "taux_conformite",
+                            ]
+                        ]
+
+                        st.dataframe(top5, use_container_width=True)
+                    else:
+                        st.info("Aucun transporteur à afficher.")
+
                     nb_relabel = int((df["surcharge_relabeling"] > 0).sum()) if "surcharge_relabeling" in df.columns else 0
                     mt_relabel = float(df["surcharge_relabeling"].sum()) if "surcharge_relabeling" in df.columns else 0.0
 
                     nb_pick = int((df["surcharge_pick_return"] > 0).sum()) if "surcharge_pick_return" in df.columns else 0
                     mt_pick = float(df["surcharge_pick_return"].sum()) if "surcharge_pick_return" in df.columns else 0.0
+
+                    st.markdown("### 📌 Indicateurs clés")
 
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Lignes contrôlées", total)
@@ -3090,7 +3498,12 @@ def main():
                     c13.metric("Coût relabel", f"{mt_relabel:.2f} €")
                     c14.metric("Coût pick & return", f"{mt_pick:.2f} €")
 
-                    st.subheader("Export des anomalies")
+                    st.divider()
+
+                    # =========================
+                    # EXPORT
+                    # =========================
+                    st.markdown("### 📤 Export des anomalies")
 
                     df_reclam = df[
                         (df["statut"].astype(str) == "KO") &
@@ -3100,53 +3513,60 @@ def main():
                     if df_reclam.empty:
                         st.info("Aucune anomalie à réclamer sur la sélection actuelle.")
                     else:
-                        total_reclam = float(pd.to_numeric(df_reclam["ecart_pos"], errors="coerce").fillna(0.0).sum())
-                        st.write(f"**{len(df_reclam)}** ligne(s) à réclamer pour un total de **{total_reclam:.2f} €**")
+                        total_reclam = float(
+                            pd.to_numeric(df_reclam["ecart_pos"], errors="coerce").fillna(0.0).sum()
+                        )
+                        st.write(
+                            f"**{len(df_reclam)}** ligne(s) à réclamer pour un total de **{total_reclam:.2f} €**"
+                        )
 
                         reclam_bytes = build_excel_reclamation(df)
+
+                        reclam_name = (
+                            f"reclamation_transport_run_{run_sel}.xlsx"
+                            if mode_dashboard == "Contrôle sélectionné"
+                            else "reclamation_transport_tous_les_controles.xlsx"
+                        )
 
                         st.download_button(
                             "📥 Télécharger le fichier de réclamation",
                             data=reclam_bytes,
-                            file_name=f"reclamation_transport_run_{run_sel}.xlsx",
+                            file_name=reclam_name,
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key="tab3_download_reclamation",
                         )
 
+                    st.divider()
+
                     # =========================
                     # GRAPHIQUES
                     # =========================
-                    st.subheader("Vue visuelle")
+                    st.markdown("### 📈 Vue visuelle")
 
                     g1, g2 = st.columns(2)
-
                     with g1:
                         st.altair_chart(chart_conformite_transporteur(df), use_container_width=True)
-
                     with g2:
                         st.altair_chart(chart_ecarts_transporteur(df), use_container_width=True)
 
                     g3, g4 = st.columns(2)
-
                     with g3:
                         st.altair_chart(chart_surcharges_transporteur(df), use_container_width=True)
-
                     with g4:
                         st.altair_chart(chart_top_anomalies(df), use_container_width=True)
 
                     g5, g6 = st.columns(2)
-
                     with g5:
-                        st.subheader("📈 Évolution mensuelle du taux de conformité")
+                        st.markdown("#### 📈 Taux de conformité mensuel")
                         st.altair_chart(chart_evolution_mensuelle_conformite(df), use_container_width=True)
-
                     with g6:
-                        st.subheader("💰 Évolution mensuelle des écarts")
+                        st.markdown("#### 💰 Écarts mensuels")
                         st.altair_chart(chart_evolution_mensuelle_ecarts(df), use_container_width=True)
 
-                        
+                    st.divider()
+
                     # =========================
-                    # SYNTHÈSE PAR TRANSPORTEUR
+                    # SYNTHÈSE
                     # =========================
                     synth = (
                         df.groupby("transporteur", dropna=False)
@@ -3167,13 +3587,15 @@ def main():
                         .sort_values("ecart_pos", ascending=False)
                     )
 
-                    st.subheader("Synthèse par transporteur")
+                    st.markdown("### 🧾 Synthèse par transporteur")
                     st.dataframe(synth, use_container_width=True)
 
+                    st.divider()
+
                     # =========================
-                    # LIGNES AVEC SURCHARGES
+                    # SURCHARGES
                     # =========================
-                    st.subheader("Lignes avec surcharges")
+                    st.markdown("### ⚠️ Lignes avec surcharges")
 
                     df_surch = df[
                         (df.get("surcharge_relabeling", 0) > 0) |
