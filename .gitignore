@@ -1,0 +1,9 @@
+# base locale
+transport_controle.db
+
+# fichiers temporaires Excel
+~$*.xlsx
+
+# cache python
+__pycache__/
+*.pyc
