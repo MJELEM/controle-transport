@@ -8,7 +8,45 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
+import hashlib
 
+# =========================
+# UTILISATEURS
+# =========================
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+USERS = {
+    "mathieu": {
+        "password": hash_password("Mathieu!2026"),
+        "role": "admin",
+    },
+    "user": {
+        "password": hash_password("userElem!2026"),
+        "role": "user",
+    },
+}
+
+def login():
+    st.markdown("## 🔐 Connexion")
+
+    username = st.text_input("Utilisateur")
+    password = st.text_input("Mot de passe", type="password")
+
+    if st.button("Se connecter"):
+        if username in USERS:
+            hashed = hash_password(password)
+            if USERS[username]["password"] == hashed:
+                st.session_state["authenticated"] = True
+                st.session_state["user"] = username
+                st.session_state["role"] = USERS[username]["role"]
+                st.success("Connexion réussie")
+                st.rerun()
+            else:
+                st.error("Mot de passe incorrect")
+        else:
+            st.error("Utilisateur inconnu")
 
 # =========================
 # CONFIG
@@ -3038,109 +3076,179 @@ def get_excel_file_resilient(file_obj_or_path) -> pd.ExcelFile:
 # =========================
 # UI
 # =========================
+def login():
+    st.markdown("## 🔐 Connexion")
+
+    username = st.text_input("Utilisateur", key="login_user")
+    password = st.text_input("Mot de passe", type="password", key="login_pwd")
+
+    if st.button("Se connecter", key="login_btn"):
+        if username in USERS:
+            hashed = hash_password(password)
+            if USERS[username]["password"] == hashed:
+                st.session_state["authenticated"] = True
+                st.session_state["user"] = username
+                st.session_state["role"] = USERS[username]["role"]
+                st.success("Connexion réussie")
+                st.rerun()
+            else:
+                st.error("Mot de passe incorrect")
+        else:
+            st.error("Utilisateur inconnu")
 def main():
     st.set_page_config(page_title="Contrôle factures transport", layout="wide")
-    st.title("🚚 Contrôle factures transport – Colis & Palettes")
+
+    # =========================
+    # AUTHENTIFICATION
+    # =========================
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if not st.session_state["authenticated"]:
+        login()
+        return
+
+    # =========================
+    # HEADER + DESIGN PREMIUM
+    # =========================
     st.markdown(
         """
         <style>
 
-        /* ===== GLOBAL ===== */
         html, body, [class*="css"]  {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
 
         .block-container {
-            padding-top: 1.5rem;
+            padding-top: 1.2rem;
             padding-bottom: 2rem;
-            max-width: 1200px;
+            max-width: 100%;
         }
 
-        h1 {
-            font-size: 2.2rem;
+        h1, h2, h3 {
+            margin-top: 0 !important;
+            padding-top: 0 !important;
+            line-height: 1.2;
+            font-weight: 600;
+        }
+
+        .app-header {
+            background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+            border: 1px solid #e5e7eb;
+            border-radius: 18px;
+            padding: 18px 20px 14px 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+            margin-bottom: 1rem;
+        }
+
+        .app-title {
+            font-size: 1.9rem;
             font-weight: 700;
             letter-spacing: -0.02em;
+            margin: 0;
+            color: #111827;
         }
 
-        h2, h3 {
+        .app-subtitle {
+            margin-top: 6px;
+            font-size: 0.95rem;
+            color: #6b7280;
+        }
+
+        .user-badge {
+            display: inline-block;
+            padding: 8px 12px;
+            border-radius: 999px;
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            color: #1d4ed8;
+            font-size: 0.82rem;
             font-weight: 600;
-            letter-spacing: -0.01em;
+            text-align: center;
+            white-space: nowrap;
         }
 
-        /* ===== KPI CARDS ===== */
+        /* KPI cards */
         div[data-testid="stMetric"] {
             background: linear-gradient(180deg, #ffffff 0%, #f9fafb 100%);
             border: 1px solid #e5e7eb;
             border-radius: 16px;
             padding: 16px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.04);
-            transition: all 0.2s ease;
-        }
-
-        div[data-testid="stMetric"]:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 6px 14px rgba(0,0,0,0.08);
         }
 
         div[data-testid="stMetricLabel"] {
-            font-size: 0.85rem;
+            font-size: 0.8rem;
             color: #6b7280;
             font-weight: 600;
         }
 
         div[data-testid="stMetricValue"] {
-            font-size: 1.5rem;
+            font-size: 1.4rem;
             font-weight: 700;
         }
 
-        /* ===== BUTTONS ===== */
+        /* boutons */
         div.stButton > button {
-            border-radius: 12px;
+            border-radius: 10px;
             border: 1px solid #d1d5db;
-            padding: 0.6rem 1.2rem;
-            font-weight: 600;
+            padding: 0.35rem 0.8rem;
+            font-size: 0.82rem;
+            font-weight: 500;
             background: white;
         }
 
         div.stButton > button:hover {
             background: #f3f4f6;
-            border-color: #9ca3af;
         }
 
         div[data-testid="stDownloadButton"] > button {
-            border-radius: 12px;
+            border-radius: 10px;
             font-weight: 600;
         }
 
-        /* ===== DATAFRAME ===== */
+        /* dataframe */
         div[data-testid="stDataFrame"] {
             border-radius: 16px;
             border: 1px solid #e5e7eb;
             overflow: hidden;
         }
 
-        /* ===== TABS ===== */
-        button[data-baseweb="tab"] {
-            font-weight: 600;
-            border-radius: 10px;
-        }
-
-        /* ===== SIDEBAR ===== */
+        /* sidebar */
         section[data-testid="stSidebar"] {
             border-right: 1px solid #e5e7eb;
-        }
-
-        /* ===== SEPARATORS ===== */
-        hr {
-            border: none;
-            border-top: 1px solid #e5e7eb;
-            margin: 1.5rem 0;
         }
 
         </style>
         """,
         unsafe_allow_html=True,
     )
+
+    st.markdown('<div class="app-header">', unsafe_allow_html=True)
+
+    col_header_1, col_header_2, col_header_3 = st.columns([7, 2, 1], vertical_alignment="center")
+
+    with col_header_1:
+        st.markdown('<div class="app-title">🚚 Contrôle des factures transport</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="app-subtitle">Analyse automatique • Détection d\'écarts • Comparaison transporteurs</div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_header_2:
+        st.markdown(
+            f'<div class="user-badge">Connecté : {st.session_state.get("user", "-")}</div>',
+            unsafe_allow_html=True,
+        )
+
+    with col_header_3:
+        if st.button("Déconnexion", key="logout_btn"):
+            st.session_state.clear()
+            st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.divider()
 
     init_db()
 
