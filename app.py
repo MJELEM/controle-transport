@@ -3095,6 +3095,91 @@ def login():
                 st.error("Mot de passe incorrect")
         else:
             st.error("Utilisateur inconnu")
+
+def convertir_plusieurs_factures(raw_files):
+    """
+    Convertit plusieurs factures brutes du même transporteur et du même segment,
+    puis concatène les données standardisées.
+
+    Retourne :
+    - df_std_all
+    - df_source_all
+    - carrier_ref
+    - segment_ref
+    """
+    if not raw_files:
+        return pd.DataFrame(), pd.DataFrame(), None, None
+
+    dfs_std = []
+    dfs_sources = []
+    carrier_ref = None
+    segment_ref = None
+
+    for f in raw_files:
+        try:
+            if hasattr(f, "seek"):
+                f.seek(0)
+        except Exception:
+            pass
+
+        df_std, df_source, carrier, segment = convert_raw_invoice(f)
+
+        if carrier_ref is None:
+            carrier_ref = carrier
+            segment_ref = segment
+        else:
+            if carrier != carrier_ref:
+                raise ValueError(
+                    f"Tous les fichiers doivent appartenir au même transporteur. "
+                    f"Détecté '{carrier}' au lieu de '{carrier_ref}' dans le fichier '{getattr(f, 'name', '')}'."
+                )
+            if segment != segment_ref:
+                raise ValueError(
+                    f"Tous les fichiers doivent appartenir au même segment. "
+                    f"Détecté '{segment}' au lieu de '{segment_ref}' dans le fichier '{getattr(f, 'name', '')}'."
+                )
+
+        df_std = df_std.copy()
+        df_source = df_source.copy()
+
+        df_std["source_file"] = getattr(f, "name", "")
+        df_source["source_file"] = getattr(f, "name", "")
+
+        dfs_std.append(df_std)
+        dfs_sources.append(df_source)
+
+    df_std_all = pd.concat(dfs_std, ignore_index=True) if dfs_std else pd.DataFrame()
+    df_source_all = pd.concat(dfs_sources, ignore_index=True) if dfs_sources else pd.DataFrame()
+
+    # =========================
+    # DÉTECTION DES DOUBLONS
+    # =========================
+    if not df_std_all.empty and "numero_facture" in df_std_all.columns:
+        df_std_all["numero_facture"] = df_std_all["numero_facture"].astype(str).str.strip()
+        df_std_all["transporteur"] = df_std_all["transporteur"].astype(str).str.strip()
+
+        dup_mask = df_std_all.duplicated(
+            subset=["transporteur", "numero_facture"],
+            keep=False
+        )
+
+        if dup_mask.any():
+            dup_df = (
+                df_std_all.loc[dup_mask, ["transporteur", "numero_facture", "source_file"]]
+                .drop_duplicates()
+                .sort_values(["transporteur", "numero_facture", "source_file"])
+            )
+
+            msg = (
+                "⚠️ Attention : des doublons de facture ont été détectés "
+                "(même transporteur + même numéro de facture)."
+            )
+            st.warning(msg)
+            st.dataframe(dup_df, use_container_width=True)
+
+    return df_std_all, df_source_all, carrier_ref, segment_ref
+
+            
 def main():
     st.set_page_config(page_title="Contrôle factures transport", layout="wide")
 
@@ -3252,106 +3337,17 @@ def main():
 
     init_db()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "➕ Nouveau contrôle",
-        "📊 Historique",
+    tab2, tab3, tab4, tab5 = st.tabs([
+                
         "📈 Dashboard",
+        "📊 Historique",
         "📦 Convertisseur",
         "🚀 Comparateur transporteurs"
     ])
 
-    with tab1:
-        st.header("Nouveau contrôle")
 
-        segment = st.radio(
-            "Segment",
-            options=["colis", "palettes"],
-            horizontal=True,
-            key="tab1_segment_radio",
-            format_func=lambda x: "Messagerie colis" if x == "colis" else "Messagerie palettes",
-        )
 
-        uploaded_file = st.file_uploader("Téléverser un fichier Excel", type=["xlsx", "xls"], key="tab1_uploader")
-
-        tolerance = st.number_input(
-            "Tolérance acceptée sur l’écart (€)",
-            min_value=0.0,
-            max_value=50.0,
-            value=float(DEFAULT_TOLERANCE_EUR),
-            step=0.01,
-            key="tab1_tolerance",
-        )
-
-        if uploaded_file is not None:
-            carrier_detected = detect_carrier(uploaded_file)
-            if carrier_detected:
-                raw_segment = CARRIERS[carrier_detected]["segment"]
-                if segment == raw_segment:
-                    if raw_segment == "palettes":
-                        st.error("Ceci est une facture brute palettes. Va dans l’onglet Convertisseur (Palettes).")
-                    else:
-                        st.error("Ceci est une facture brute colis. Va dans l’onglet Convertisseur (Colis).")
-                    st.stop()
-
-        if uploaded_file is not None and st.button("Lancer le contrôle", key="tab1_run_btn"):
-            try:
-                if segment == "colis":
-                    df_res = controler_colis(uploaded_file, uploaded_file.name, tolerance)
-                else:
-                    df_res = controler_palettes(uploaded_file, uploaded_file.name, tolerance)
-            except Exception as e:
-                st.error(str(e))
-                st.stop()
-
-            run_info = build_run_info(df_res, uploaded_file.name, segment)
-            run_id = save_run_and_lines(run_info, df_res)
-
-            st.success(f"Contrôle terminé ✅ (run #{run_id})")
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Lignes", run_info["nb_lignes"])
-            c2.metric("OK", run_info["nb_ok"])
-            c3.metric("KO", run_info["nb_ko"])
-            c4.metric("INCOMPLET", run_info["nb_incomplet"])
-
-            c5, c6, c7 = st.columns(3)
-            c5.metric("Facturé", f"{run_info['montant_facture_total']:.2f} €")
-            c6.metric("Calculé", f"{run_info['montant_calcule_total']:.2f} €")
-            c7.metric("Écart total", f"{run_info['ecart_total']:.2f} €")
-
-            c8, c9 = st.columns(2)
-            c8.metric("Écarts + (à réclamer)", f"{run_info['ecart_total_pos']:.2f} €")
-            c9.metric("Écarts - (informatif)", f"{run_info['ecart_total_neg']:.2f} €")
-
-            st.metric("Taux de conformité", f"{run_info['taux_conformite']:.2f} %")
-
-            df_show = df_res.copy()
-
-            f1, f2, f3 = st.columns(3)
-            statuts = f1.multiselect("Statut", ["OK", "KO", "INCOMPLET"], default=["KO", "INCOMPLET"], key="tab1_statut")
-            transporteurs = sorted(df_show["transporteur"].dropna().astype(str).unique().tolist())
-            tr_sel = f2.multiselect("Transporteur", transporteurs, default=transporteurs, key="tab1_transporteur")
-            factures = sorted(df_show["numero_facture"].dropna().astype(str).unique().tolist())
-            fac_sel = f3.multiselect("Numéro facture", factures, default=factures, key="tab1_facture")
-
-            df_show = df_show[df_show["statut"].isin(statuts)]
-            df_show = df_show[df_show["transporteur"].astype(str).isin([str(x) for x in tr_sel])]
-            df_show = df_show[df_show["numero_facture"].astype(str).isin([str(x) for x in fac_sel])]
-
-            st.dataframe(df_show, use_container_width=True)
-
-            excel_bytes = build_excel_report(df_res)
-            st.download_button(
-                "📥 Télécharger le rapport Excel",
-                data=excel_bytes,
-                file_name=f"rapport_controle_{segment}_{run_id}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key="tab1_download",
-            )
-
-            st.altair_chart(chart_statuts(df_res), use_container_width=True)
-
-    with tab2:
+    with tab3:
         st.header("Historique")
         df_runs = get_runs()
         if df_runs.empty:
@@ -3363,7 +3359,7 @@ def main():
             st.subheader(f"Lignes du run #{run_id_sel}")
             st.dataframe(df_lines, use_container_width=True)
 
-    with tab3:
+    with tab2:
         st.header("📊 Tableau de bord")
 
         df_runs = get_runs()
@@ -3735,8 +3731,8 @@ def main():
         with subtab_conv1:
             st.subheader("Convertisseur palettes")
             st.caption(
-                "Téléverse une facture brute palettes (TFM, GEODIS, ...) pour la convertir "
-                "et/ou la contrôler avec le tarif master palettes."
+                "Téléverse une ou plusieurs factures brutes palettes (TFM, GEODIS, VMG, GLS PAL...) "
+                "pour les convertir et/ou les contrôler avec le tarif master palettes."
             )
 
             if Path(TARIFS_PALETTE_MASTER_PATH).exists():
@@ -3744,9 +3740,10 @@ def main():
             else:
                 st.warning(f"Tarif master manquant : {TARIFS_PALETTE_MASTER_PATH}")
 
-            raw_file = st.file_uploader(
-                "Facture brute palettes (.xlsx)",
+            raw_files = st.file_uploader(
+                "Facture(s) brute(s) palettes (.xlsx)",
                 type=["xlsx"],
+                accept_multiple_files=True,
                 key="tab4_pal_uploader",
             )
 
@@ -3761,32 +3758,37 @@ def main():
                 key="tab4_pal_tol",
             )
 
-            if raw_file is not None:
-                carrier = detect_carrier(raw_file)
-                if carrier and CARRIERS[carrier]["segment"] == "palettes":
-                    st.info(f"Transporteur détecté : **{carrier}**")
-                elif carrier:
-                    st.warning(
-                        f"Le fichier détecté appartient au segment "
-                        f"**{CARRIERS[carrier]['segment']}**, pas palettes."
-                    )
-                else:
-                    st.warning("Transporteur non détecté automatiquement.")
+            if raw_files:
+                detected = []
+                for f in raw_files:
+                    carrier = detect_carrier(f)
+                    detected.append((getattr(f, "name", ""), carrier))
+
+                st.markdown("#### Fichiers détectés")
+                st.dataframe(
+                    pd.DataFrame(detected, columns=["fichier", "transporteur_detecte"]),
+                    use_container_width=True,
+                )
 
                 if colA.button("Convertir", key="tab4_pal_convert_btn"):
                     try:
-                        df_std, df_source, carrier2, segment2 = convert_raw_invoice(raw_file)
+                        df_std, df_source, carrier2, segment2 = convertir_plusieurs_factures(raw_files)
+
                         if segment2 != "palettes":
-                            raise ValueError("Cette facture brute n'appartient pas au segment palettes.")
+                            raise ValueError("Les fichiers sélectionnés n'appartiennent pas tous au segment palettes.")
 
                         out_bytes = build_excel_from_df(df_std, df_source, f"source_{carrier2}", segment2)
-                        st.success("Conversion terminée ✅")
+
+                        st.success(
+                            f"Conversion terminée ✅ | "
+                            f"{len(raw_files)} fichier(s) | transporteur : {carrier2} | lignes : {len(df_std)}"
+                        )
                         st.dataframe(df_std.head(200), use_container_width=True)
 
                         st.download_button(
                             "📥 Télécharger la facture standardisée palettes",
                             data=out_bytes,
-                            file_name=f"{carrier2}_{Path(raw_file.name).stem}_standardisee_palettes.xlsx",
+                            file_name=f"{carrier2}_multi_standardisee_palettes.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key="tab4_pal_download_std",
                         )
@@ -3796,10 +3798,10 @@ def main():
                 if colB.button("Convertir + Lancer contrôle", key="tab4_pal_convert_and_control"):
                     try:
                         t_master = load_tarifs_palette_master()
-                        df_std, _, carrier2, segment2 = convert_raw_invoice(raw_file)
+                        df_std, _, carrier2, segment2 = convertir_plusieurs_factures(raw_files)
 
                         if segment2 != "palettes":
-                            raise ValueError("Cette facture brute n'appartient pas au segment palettes.")
+                            raise ValueError("Les fichiers sélectionnés n'appartiennent pas tous au segment palettes.")
 
                         xls_out = BytesIO()
                         with pd.ExcelWriter(xls_out, engine="openpyxl") as w:
@@ -3807,11 +3809,14 @@ def main():
                             df_std.to_excel(w, sheet_name="facture_palette_brut", index=False)
                         xls_out.seek(0)
 
-                        df_res = controler_palettes(xls_out, f"CTRL_{raw_file.name}", tol_palette)
-                        run_info = build_run_info(df_res, f"CTRL_{raw_file.name}", "palettes")
+                        df_res = controler_palettes(xls_out, f"CTRL_MULTI_{carrier2}.xlsx", tol_palette)
+                        run_info = build_run_info(df_res, f"CTRL_MULTI_{carrier2}.xlsx", "palettes")
                         run_id = save_run_and_lines(run_info, df_res)
 
-                        st.success(f"Contrôle palettes terminé ✅ (run #{run_id})")
+                        st.success(
+                            f"Contrôle palettes terminé ✅ (run #{run_id}) | "
+                            f"{len(raw_files)} fichier(s) consolidé(s)"
+                        )
                         st.subheader("Lignes KO / INCOMPLET")
                         st.dataframe(
                             df_res[df_res["statut"].isin(["KO", "INCOMPLET"])],
@@ -3835,8 +3840,8 @@ def main():
         with subtab_conv2:
             st.subheader("Convertisseur colis")
             st.caption(
-                "Téléverse une facture brute colis (DPD, GLS, ...) pour la convertir "
-                "et/ou la contrôler avec le tarif master colis."
+                "Téléverse une ou plusieurs factures brutes colis (DPD, GLS, ...) "
+                "pour les convertir et/ou les contrôler avec le tarif master colis."
             )
 
             if Path(TARIFS_COLIS_MASTER_PATH).exists():
@@ -3844,9 +3849,10 @@ def main():
             else:
                 st.warning(f"Tarif master manquant : {TARIFS_COLIS_MASTER_PATH}")
 
-            raw_file = st.file_uploader(
-                "Facture brute colis (.xlsx)",
+            raw_files = st.file_uploader(
+                "Facture(s) brute(s) colis (.xlsx)",
                 type=["xlsx"],
+                accept_multiple_files=True,
                 key="tab4_col_uploader",
             )
 
@@ -3861,32 +3867,37 @@ def main():
                 key="tab4_col_tol",
             )
 
-            if raw_file is not None:
-                carrier = detect_carrier(raw_file)
-                if carrier and CARRIERS[carrier]["segment"] == "colis":
-                    st.info(f"Transporteur détecté : **{carrier}**")
-                elif carrier:
-                    st.warning(
-                        f"Le fichier détecté appartient au segment "
-                        f"**{CARRIERS[carrier]['segment']}**, pas colis."
-                    )
-                else:
-                    st.warning("Transporteur non détecté automatiquement.")
+            if raw_files:
+                detected = []
+                for f in raw_files:
+                    carrier = detect_carrier(f)
+                    detected.append((getattr(f, "name", ""), carrier))
+
+                st.markdown("#### Fichiers détectés")
+                st.dataframe(
+                    pd.DataFrame(detected, columns=["fichier", "transporteur_detecte"]),
+                    use_container_width=True,
+                )
 
                 if colA.button("Convertir", key="tab4_col_convert_btn"):
                     try:
-                        df_std, df_source, carrier2, segment2 = convert_raw_invoice(raw_file)
+                        df_std, df_source, carrier2, segment2 = convertir_plusieurs_factures(raw_files)
+
                         if segment2 != "colis":
-                            raise ValueError("Cette facture brute n'appartient pas au segment colis.")
+                            raise ValueError("Les fichiers sélectionnés n'appartiennent pas tous au segment colis.")
 
                         out_bytes = build_excel_from_df(df_std, df_source, f"source_{carrier2}", segment2)
-                        st.success("Conversion terminée ✅")
+
+                        st.success(
+                            f"Conversion terminée ✅ | "
+                            f"{len(raw_files)} fichier(s) | transporteur : {carrier2} | lignes : {len(df_std)}"
+                        )
                         st.dataframe(df_std.head(200), use_container_width=True)
 
                         st.download_button(
                             "📥 Télécharger la facture standardisée colis",
                             data=out_bytes,
-                            file_name=f"{carrier2}_{Path(raw_file.name).stem}_standardisee_colis.xlsx",
+                            file_name=f"{carrier2}_multi_standardisee_colis.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key="tab4_col_download_std",
                         )
@@ -3896,10 +3907,10 @@ def main():
                 if colB.button("Convertir + Lancer contrôle", key="tab4_col_convert_and_control"):
                     try:
                         tarifs = load_tarifs_colis_master()
-                        df_std, _, carrier2, segment2 = convert_raw_invoice(raw_file)
+                        df_std, _, carrier2, segment2 = convertir_plusieurs_factures(raw_files)
 
                         if segment2 != "colis":
-                            raise ValueError("Cette facture brute n'appartient pas au segment colis.")
+                            raise ValueError("Les fichiers sélectionnés n'appartiennent pas tous au segment colis.")
 
                         xls_out = BytesIO()
                         with pd.ExcelWriter(xls_out, engine="openpyxl") as w:
@@ -3907,11 +3918,14 @@ def main():
                             df_std.to_excel(w, sheet_name="facture_lignes", index=False)
                         xls_out.seek(0)
 
-                        df_res = controler_colis(xls_out, f"CTRL_{raw_file.name}", tol_colis)
-                        run_info = build_run_info(df_res, f"CTRL_{raw_file.name}", "colis")
+                        df_res = controler_colis(xls_out, f"CTRL_MULTI_{carrier2}.xlsx", tol_colis)
+                        run_info = build_run_info(df_res, f"CTRL_MULTI_{carrier2}.xlsx", "colis")
                         run_id = save_run_and_lines(run_info, df_res)
 
-                        st.success(f"Contrôle colis terminé ✅ (run #{run_id})")
+                        st.success(
+                            f"Contrôle colis terminé ✅ (run #{run_id}) | "
+                            f"{len(raw_files)} fichier(s) consolidé(s)"
+                        )
                         st.subheader("Lignes KO / INCOMPLET")
                         st.dataframe(
                             df_res[df_res["statut"].isin(["KO", "INCOMPLET"])],
