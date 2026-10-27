@@ -696,14 +696,14 @@ def convert_tfm_palette_to_standard(file_bytes) -> tuple[pd.DataFrame, pd.DataFr
     reference_client = src[ref_col].astype(str).str.strip() if ref_col else ""
 
     pays = src.get("Pays.1", "").apply(map_country)
-    qt = pd.to_numeric(src.get("Quantité tarif"), errors="coerce").fillna(0)
+    qt = pd.to_numeric(src.get("Quantité tarif"), errors="coerce").fillna(0).astype("float64")
     unit1 = src.get("Unité.1", "").astype(str).str.strip().str.upper()
     nombre = pd.to_numeric(src.get("Nombre"), errors="coerce").fillna(0)
 
     nb_palettes = pd.Series(0.0, index=src.index)
     nb_palettes[pays == "FR"] = nombre[pays == "FR"]
 
-    nb_qt = qt.copy()
+    nb_qt = qt.astype("float64").copy()
     nb_qt[unit1 == "DEMI"] = nb_qt[unit1 == "DEMI"] * 0.5
     nb_palettes[pays != "FR"] = nb_qt[pays != "FR"]
 
